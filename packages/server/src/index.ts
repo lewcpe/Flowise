@@ -3,8 +3,8 @@ import path from 'path'
 import cors from 'cors'
 import http from 'http'
 import cookieParser from 'cookie-parser'
-import { DataSource, IsNull } from 'typeorm'
-import { MODE, Platform } from './Interface'
+import { DataSource } from 'typeorm' // Removed IsNull
+import { MODE } from './Interface' // Removed Platform
 import { getNodeModulesPackagePath, getEncryptionKey } from './utils'
 import logger, { expressRequestLogger } from './utils/logger'
 import { getDataSource } from './DataSource'
@@ -18,11 +18,11 @@ import { Telemetry } from './utils/telemetry'
 import flowiseApiV1Router from './routes'
 import errorHandlerMiddleware from './middlewares/errors'
 import { WHITELIST_URLS } from './utils/constants'
-import { initializeJwtCookieMiddleware, verifyToken } from './enterprise/middleware/passport'
+import { initializeJwtCookieMiddleware } from './enterprise/middleware/passport' // Removed verifyToken
 import { IdentityManager } from './IdentityManager'
 import { SSEStreamer } from './utils/SSEStreamer'
-import { getAPIKeyWorkspaceID, validateAPIKey } from './utils/validateKey'
-import { LoggedInUser } from './enterprise/Interface.Enterprise'
+// Removed getAPIKeyWorkspaceID, validateAPIKey from './utils/validateKey'
+import { LoggedInUser } from './enterprise/Interface.Enterprise' // Keeping LoggedInUser for now
 import { IMetricsProvider } from './Interface.Metrics'
 import { Prometheus } from './metrics/Prometheus'
 import { OpenTelemetry } from './metrics/OpenTelemetry'
@@ -30,18 +30,23 @@ import { QueueManager } from './queue/QueueManager'
 import { RedisEventSubscriber } from './queue/RedisEventSubscriber'
 import 'global-agent/bootstrap'
 import { UsageCacheManager } from './UsageCacheManager'
-import { Workspace } from './enterprise/database/entities/workspace.entity'
-import { Organization } from './enterprise/database/entities/organization.entity'
-import { GeneralRole, Role } from './enterprise/database/entities/role.entity'
+// Removed Workspace, Organization, GeneralRole, Role imports
 import { migrateApiKeysFromJsonToDb } from './utils/apiKey'
 import flowiseUserService from './services/flowise-user'
 
 declare global {
     namespace Express {
-        interface User extends LoggedInUser {} // Keep this as is for now
-        interface Request {
-            user?: LoggedInUser | { id: string; email: string; isAuthenticatedByHeader?: boolean } // Updated
+        // Ensure Express.User is based on LoggedInUser
+        interface User extends LoggedInUser {
+            isAuthenticatedByHeader?: boolean; // Added optional property
         }
+
+        // The Request interface should use the User type defined above.
+        interface Request {
+            user?: User;
+        }
+        
+        // Multer definition can remain if it exists and is correct
         namespace Multer {
             interface File {
                 bucket: string
@@ -186,115 +191,67 @@ export class App {
         const URL_CASE_INSENSITIVE_REGEX: RegExp = /\/api\/v1\//i
         const URL_CASE_SENSITIVE_REGEX: RegExp = /\/api\/v1\//
 
-        await initializeJwtCookieMiddleware(this.app, this.identityManager)
+        await initializeJwtCookieMiddleware(this.app, this.identityManager) // This can be kept if it doesn't interfere with the new logic (e.g. sets cookies but doesn't block)
 
+        // Simplified Authentication Middleware
         this.app.use(async (req: Request, res: Response, next: express.NextFunction) => {
             if (URL_CASE_INSENSITIVE_REGEX.test(req.path)) {
                 if (URL_CASE_SENSITIVE_REGEX.test(req.path)) {
                     const isWhitelisted = whitelistURLs.some((url) => req.path.startsWith(url));
-
                     if (isWhitelisted) {
-                        return next();
+                        return next(); // Whitelisted, proceed
                     }
 
-                    // Check for X-Forwarded-Email header FIRST
+                    // If not whitelisted, check for X-Forwarded-Email header
                     const forwardedEmail = req.headers['x-forwarded-email'] as string;
                     if (forwardedEmail) {
                         try {
-                            const user = await flowiseUserService.findOrCreateUserByEmail(forwardedEmail);
-                            // @ts-ignore
-                            req.user = {
-                                id: user.id,
-                                email: user.email,
-                                isAuthenticatedByHeader: true
-                                // Add any other essential, non-enterprise user properties here if needed
-                                // For now, keeping it minimal.
+                            const flowiseDbUser = await flowiseUserService.findOrCreateUserByEmail(forwardedEmail);
+                            
+                            const loggedInUserShape: Express.User = {
+                                // Core properties from FlowiseUser
+                                id: flowiseDbUser.id,
+                                email: flowiseDbUser.email,
+                        
+                                // Custom flag
+                                isAuthenticatedByHeader: true,
+                        
+                                // Default/placeholder values for other LoggedInUser properties
+                                name: flowiseDbUser.email, // Defaulting name to email
+                                roleId: '', // Default to empty string or a specific "guest/header" role ID
+                                activeOrganizationId: '', // Default to empty string or specific placeholder
+                                activeOrganizationSubscriptionId: '', // Default
+                                activeOrganizationCustomerId: '', // Default
+                                activeOrganizationProductId: '', // Default
+                                isOrganizationAdmin: false, // Default
+                                activeWorkspaceId: '', // Default
+                                activeWorkspace: '', // Default
+                                assignedWorkspaces: [], // Default
+                                isApiKeyValidated: false, // Default
+                                permissions: [], // Default
+                                features: {}, // Default
+                                ssoRefreshToken: undefined, // Default
+                                ssoToken: undefined, // Default
+                                ssoProvider: undefined // Default
                             };
+                            req.user = loggedInUserShape;
                             return next();
                         } catch (error) {
                             logger.error('Error during X-Forwarded-Email authentication:', error);
                             return res.status(500).json({ error: 'Internal Server Error during authentication' });
                         }
-                    }
-
-                    // If X-Forwarded-Email is not present, proceed with existing logic
-                    // (internal requests, license checks, API key validation)
-
-                    if (req.headers['x-request-from'] === 'internal') {
-                        return verifyToken(req, res, next); // This is enterprise, but keep as is for internal requests
-                    }
-
-                    // Only check license validity for non-open-source platforms
-                    if (this.identityManager.getPlatformType() !== Platform.OPEN_SOURCE) {
-                        if (!this.identityManager.isLicenseValid()) {
-                            return res.status(401).json({ error: 'Unauthorized Access - Invalid License' });
-                        }
-                    }
-
-                    const isKeyValidated = await validateAPIKey(req);
-                    if (!isKeyValidated) {
-                        // This is the crucial part: if no X-Forwarded-Email and no valid API key, deny access.
-                        return res.status(401).json({ error: 'Unauthorized Access - Missing or Invalid API Key' });
-                    }
-
-                    // API Key is validated, proceed to populate req.user with API key details (existing logic)
-                    const apiKeyWorkSpaceId = await getAPIKeyWorkspaceID(req);
-                    if (apiKeyWorkSpaceId) {
-                        // Find workspace
-                        const workspace = await this.AppDataSource.getRepository(Workspace).findOne({
-                            where: { id: apiKeyWorkSpaceId }
-                        });
-                        if (!workspace) {
-                            return res.status(401).json({ error: 'Unauthorized Access - Invalid Workspace' });
-                        }
-
-                        // Find owner role
-                        const ownerRole = await this.AppDataSource.getRepository(Role).findOne({
-                            where: { name: GeneralRole.OWNER, organizationId: IsNull() }
-                        });
-                        if (!ownerRole) {
-                            return res.status(401).json({ error: 'Unauthorized Access - Role Configuration Error' });
-                        }
-
-                        // Find organization
-                        const activeOrganizationId = workspace.organizationId as string;
-                        const org = await this.AppDataSource.getRepository(Organization).findOne({
-                            where: { id: activeOrganizationId }
-                        });
-                        if (!org) {
-                            return res.status(401).json({ error: 'Unauthorized Access - Invalid Organization' });
-                        }
-                        const subscriptionId = org.subscriptionId as string;
-                        const customerId = org.customerId as string;
-                        const features = await this.identityManager.getFeaturesByPlan(subscriptionId);
-                        const productId = await this.identityManager.getProductIdFromSubscription(subscriptionId);
-
-                        // @ts-ignore
-                        req.user = {
-                            permissions: [...JSON.parse(ownerRole.permissions)],
-                            features,
-                            activeOrganizationId: activeOrganizationId,
-                            activeOrganizationSubscriptionId: subscriptionId,
-                            activeOrganizationCustomerId: customerId,
-                            activeOrganizationProductId: productId,
-                            isOrganizationAdmin: true,
-                            activeWorkspaceId: apiKeyWorkSpaceId,
-                            activeWorkspace: workspace.name,
-                            isApiKeyValidated: true
-                        };
-                        return next();
                     } else {
-                        // This case implies API key was validated but no workspace ID found, which is an issue.
-                        return res.status(401).json({ error: 'Unauthorized Access - API Key Workspace Error' });
+                        // Not whitelisted and no X-Forwarded-Email header for an /api/v1/ path
+                        return res.status(401).json({ error: 'Unauthorized: X-Forwarded-Email header is required' });
                     }
-                } else { // Path does not match URL_CASE_SENSITIVE_REGEX
+                } else { // Path does not match URL_CASE_SENSITIVE_REGEX (e.g. /api/v1/UPPERCASE_PATH)
                     return res.status(401).json({ error: 'Unauthorized Access - Invalid Path Structure' });
                 }
-            } else { // Path does not match URL_CASE_INSENSITIVE_REGEX (i.e., not an /api/v1/ path)
+            } else { // Path does not contain /api/v1 (e.g. /assets, /canvas)
                 return next();
             }
-        })
-
+        });
+        
         // this is for SSO and must be after the JWT cookie middleware
         await this.identityManager.initializeSSO(this.app)
 
