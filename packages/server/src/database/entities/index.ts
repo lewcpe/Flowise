@@ -25,6 +25,7 @@ import { OrganizationUser } from '../../enterprise/database/entities/organizatio
 import { Workspace } from '../../enterprise/database/entities/workspace.entity'
 import { WorkspaceUser } from '../../enterprise/database/entities/workspace-user.entity'
 import { LoginMethod } from '../../enterprise/database/entities/login-method.entity'
+import { FlowiseUser } from './FlowiseUser'
 
 export const entities = {
     ChatFlow,
@@ -44,6 +45,7 @@ export const entities = {
     EvaluationRun,
     Evaluator,
     ApiKey,
+    FlowiseUser,
     User,
     WorkspaceUsers,
     LoginActivity,
