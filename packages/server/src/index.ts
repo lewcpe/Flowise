@@ -34,12 +34,13 @@ import { Workspace } from './enterprise/database/entities/workspace.entity'
 import { Organization } from './enterprise/database/entities/organization.entity'
 import { GeneralRole, Role } from './enterprise/database/entities/role.entity'
 import { migrateApiKeysFromJsonToDb } from './utils/apiKey'
+import flowiseUserService from './services/flowise-user'
 
 declare global {
     namespace Express {
-        interface User extends LoggedInUser {}
+        interface User extends LoggedInUser {} // Keep this as is for now
         interface Request {
-            user?: LoggedInUser
+            user?: LoggedInUser | { id: string; email: string; isAuthenticatedByHeader?: boolean } // Updated
         }
         namespace Multer {
             interface File {
@@ -187,83 +188,110 @@ export class App {
 
         await initializeJwtCookieMiddleware(this.app, this.identityManager)
 
-        this.app.use(async (req, res, next) => {
-            // Step 1: Check if the req path contains /api/v1 regardless of case
+        this.app.use(async (req: Request, res: Response, next: express.NextFunction) => {
             if (URL_CASE_INSENSITIVE_REGEX.test(req.path)) {
-                // Step 2: Check if the req path is casesensitive
                 if (URL_CASE_SENSITIVE_REGEX.test(req.path)) {
-                    // Step 3: Check if the req path is in the whitelist
-                    const isWhitelisted = whitelistURLs.some((url) => req.path.startsWith(url))
+                    const isWhitelisted = whitelistURLs.some((url) => req.path.startsWith(url));
+
                     if (isWhitelisted) {
-                        next()
-                    } else if (req.headers['x-request-from'] === 'internal') {
-                        verifyToken(req, res, next)
-                    } else {
-                        // Only check license validity for non-open-source platforms
-                        if (this.identityManager.getPlatformType() !== Platform.OPEN_SOURCE) {
-                            if (!this.identityManager.isLicenseValid()) {
-                                return res.status(401).json({ error: 'Unauthorized Access' })
-                            }
-                        }
-                        const isKeyValidated = await validateAPIKey(req)
-                        if (!isKeyValidated) {
-                            return res.status(401).json({ error: 'Unauthorized Access' })
-                        }
-                        const apiKeyWorkSpaceId = await getAPIKeyWorkspaceID(req)
-                        if (apiKeyWorkSpaceId) {
-                            // Find workspace
-                            const workspace = await this.AppDataSource.getRepository(Workspace).findOne({
-                                where: { id: apiKeyWorkSpaceId }
-                            })
-                            if (!workspace) {
-                                return res.status(401).json({ error: 'Unauthorized Access' })
-                            }
+                        return next();
+                    }
 
-                            // Find owner role
-                            const ownerRole = await this.AppDataSource.getRepository(Role).findOne({
-                                where: { name: GeneralRole.OWNER, organizationId: IsNull() }
-                            })
-                            if (!ownerRole) {
-                                return res.status(401).json({ error: 'Unauthorized Access' })
-                            }
-
-                            // Find organization
-                            const activeOrganizationId = workspace.organizationId as string
-                            const org = await this.AppDataSource.getRepository(Organization).findOne({
-                                where: { id: activeOrganizationId }
-                            })
-                            if (!org) {
-                                return res.status(401).json({ error: 'Unauthorized Access' })
-                            }
-                            const subscriptionId = org.subscriptionId as string
-                            const customerId = org.customerId as string
-                            const features = await this.identityManager.getFeaturesByPlan(subscriptionId)
-                            const productId = await this.identityManager.getProductIdFromSubscription(subscriptionId)
-
+                    // Check for X-Forwarded-Email header FIRST
+                    const forwardedEmail = req.headers['x-forwarded-email'] as string;
+                    if (forwardedEmail) {
+                        try {
+                            const user = await flowiseUserService.findOrCreateUserByEmail(forwardedEmail);
                             // @ts-ignore
                             req.user = {
-                                permissions: [...JSON.parse(ownerRole.permissions)],
-                                features,
-                                activeOrganizationId: activeOrganizationId,
-                                activeOrganizationSubscriptionId: subscriptionId,
-                                activeOrganizationCustomerId: customerId,
-                                activeOrganizationProductId: productId,
-                                isOrganizationAdmin: true,
-                                activeWorkspaceId: apiKeyWorkSpaceId,
-                                activeWorkspace: workspace.name,
-                                isApiKeyValidated: true
-                            }
-                            next()
-                        } else {
-                            return res.status(401).json({ error: 'Unauthorized Access' })
+                                id: user.id,
+                                email: user.email,
+                                isAuthenticatedByHeader: true
+                                // Add any other essential, non-enterprise user properties here if needed
+                                // For now, keeping it minimal.
+                            };
+                            return next();
+                        } catch (error) {
+                            logger.error('Error during X-Forwarded-Email authentication:', error);
+                            return res.status(500).json({ error: 'Internal Server Error during authentication' });
                         }
                     }
-                } else {
-                    return res.status(401).json({ error: 'Unauthorized Access' })
+
+                    // If X-Forwarded-Email is not present, proceed with existing logic
+                    // (internal requests, license checks, API key validation)
+
+                    if (req.headers['x-request-from'] === 'internal') {
+                        return verifyToken(req, res, next); // This is enterprise, but keep as is for internal requests
+                    }
+
+                    // Only check license validity for non-open-source platforms
+                    if (this.identityManager.getPlatformType() !== Platform.OPEN_SOURCE) {
+                        if (!this.identityManager.isLicenseValid()) {
+                            return res.status(401).json({ error: 'Unauthorized Access - Invalid License' });
+                        }
+                    }
+
+                    const isKeyValidated = await validateAPIKey(req);
+                    if (!isKeyValidated) {
+                        // This is the crucial part: if no X-Forwarded-Email and no valid API key, deny access.
+                        return res.status(401).json({ error: 'Unauthorized Access - Missing or Invalid API Key' });
+                    }
+
+                    // API Key is validated, proceed to populate req.user with API key details (existing logic)
+                    const apiKeyWorkSpaceId = await getAPIKeyWorkspaceID(req);
+                    if (apiKeyWorkSpaceId) {
+                        // Find workspace
+                        const workspace = await this.AppDataSource.getRepository(Workspace).findOne({
+                            where: { id: apiKeyWorkSpaceId }
+                        });
+                        if (!workspace) {
+                            return res.status(401).json({ error: 'Unauthorized Access - Invalid Workspace' });
+                        }
+
+                        // Find owner role
+                        const ownerRole = await this.AppDataSource.getRepository(Role).findOne({
+                            where: { name: GeneralRole.OWNER, organizationId: IsNull() }
+                        });
+                        if (!ownerRole) {
+                            return res.status(401).json({ error: 'Unauthorized Access - Role Configuration Error' });
+                        }
+
+                        // Find organization
+                        const activeOrganizationId = workspace.organizationId as string;
+                        const org = await this.AppDataSource.getRepository(Organization).findOne({
+                            where: { id: activeOrganizationId }
+                        });
+                        if (!org) {
+                            return res.status(401).json({ error: 'Unauthorized Access - Invalid Organization' });
+                        }
+                        const subscriptionId = org.subscriptionId as string;
+                        const customerId = org.customerId as string;
+                        const features = await this.identityManager.getFeaturesByPlan(subscriptionId);
+                        const productId = await this.identityManager.getProductIdFromSubscription(subscriptionId);
+
+                        // @ts-ignore
+                        req.user = {
+                            permissions: [...JSON.parse(ownerRole.permissions)],
+                            features,
+                            activeOrganizationId: activeOrganizationId,
+                            activeOrganizationSubscriptionId: subscriptionId,
+                            activeOrganizationCustomerId: customerId,
+                            activeOrganizationProductId: productId,
+                            isOrganizationAdmin: true,
+                            activeWorkspaceId: apiKeyWorkSpaceId,
+                            activeWorkspace: workspace.name,
+                            isApiKeyValidated: true
+                        };
+                        return next();
+                    } else {
+                        // This case implies API key was validated but no workspace ID found, which is an issue.
+                        return res.status(401).json({ error: 'Unauthorized Access - API Key Workspace Error' });
+                    }
+                } else { // Path does not match URL_CASE_SENSITIVE_REGEX
+                    return res.status(401).json({ error: 'Unauthorized Access - Invalid Path Structure' });
                 }
-            } else {
-                // If the req path does not contain /api/v1, then allow the request to pass through, example: /assets, /canvas
-                next()
+            } else { // Path does not match URL_CASE_INSENSITIVE_REGEX (i.e., not an /api/v1/ path)
+                return next();
             }
         })
 
